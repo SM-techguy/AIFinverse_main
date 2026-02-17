@@ -74,7 +74,7 @@ class StrategyEnum(str, Enum):
     Momentum = "Momentum Riders (52-week High/Low, All-Time High/Low)"
     Breakout = "Cycle Count Reversal"
     Reversal = "Mean Reversion"
-    ContrabetsDTDB = "Double Top - Double Bottom (Contrabets)"
+    ContrabetsDTDB = "Swing Trade"
     ContrabetsCandle = "Topping Candle - Bottoming Candle (Contrabets)"
     ChartPatterns = "Pattern Formation"
     Picks = "Fundamental Picks (Earnings Season focused)"
@@ -1566,4 +1566,5 @@ async def telegram_webhook_watchlist(request: Request):
     except Exception as e:
         print("❌ Watchlist webhook unexpected error:", e)
         return {"status": "ok"}
+
 
