@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
 from passlib.context import CryptContext
@@ -32,7 +32,8 @@ AWS_SECRET_ACCESS_KEY = "4f9Y9pEHIesHbMlEj+eEYedM9trVsfi0GLCxv5Du"
 AWS_REGION = "us-east-1"
 S3_BUCKET_NAME = "aifinverse"
 S3_USERS_FILE_KEY = "users.json"
-S3_REALTIME_ALERTS_CSV_KEY = "52_WH/realtime_alerts.csv"  # same directory as before
+S3_REALTIME_ALERTS_INDIA_JSON_KEY = "52_WH/realtime_alerts_INDIA.json"  # India alerts JSON file
+S3_REALTIME_ALERTS_US_JSON_KEY = "52_WH/realtime_alerts_US.json"  # US alerts JSON file
 
 TAVILY_API_KEY = "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"
 TAVILY_SEARCH_URL = "https://api.tavily.com/search"
@@ -40,6 +41,11 @@ TAVILY_SEARCH_URL = "https://api.tavily.com/search"
 TELEGRAM_BOT_TOKEN_US = "8515387318:AAEKWrh35aAG1vIhQe4Nde7pmRLvcNGggxY"
 TELEGRAM_BOT_TOKEN_INDIA = "8461838689:AAH9SUFHliFXSOf5A1Yx5PhnBZ3uthQuZ_s"
 TELEGRAM_BOT_TOKEN_WATCHLIST = "8236210636:AAH9n64cvol61iGhKOuw4tl17ita0YIfuVk"
+
+S3_POSTS_FILE_KEY = "posts/posts.json"
+S3_POST_IMAGES_KEY = "posts/images/"
+S3_COMMENTS_FILE_KEY = "posts/comments.json"
+S3_NEWSLETTERS_FILE_KEY = "posts/newsletters.json"
 
 # -------------------- MIDDLEWARE --------------------
 app.add_middleware(
@@ -74,7 +80,7 @@ class StrategyEnum(str, Enum):
     Momentum = "Momentum Riders (52-week High/Low, All-Time High/Low)"
     Breakout = "Cycle Count Reversal"
     Reversal = "Mean Reversion"
-    ContrabetsDTDB = "Double Top - Double Bottom (Contrabets)"
+    ContrabetsDTDB = "Swing Trade"
     ContrabetsCandle = "Topping Candle - Bottoming Candle (Contrabets)"
     ChartPatterns = "Pattern Formation"
     Picks = "Fundamental Picks (Earnings Season focused)"
@@ -112,6 +118,89 @@ class WatchlistModifyRequest(BaseModel):
     user_id: str
     companies: List[str]  # company_name list
     action: str  # "add" or "remove"
+
+class PostCreate(BaseModel):
+    title: str
+    subtitle: Optional[str] = None
+    content: str  # HTML content from rich text editor
+    excerpt: Optional[str] = None
+    featured_image_url: Optional[str] = None
+    status: str = "published"  # draft, published
+    category: Optional[str] = None
+    tags: List[str] = []
+    meta_description: Optional[str] = None
+    is_featured: bool = False
+
+class PostUpdate(BaseModel):
+    title: Optional[str] = None
+    subtitle: Optional[str] = None
+    content: Optional[str] = None
+    excerpt: Optional[str] = None
+    featured_image_url: Optional[str] = None
+    status: Optional[str] = None
+    category: Optional[str] = None
+    tags: Optional[List[str]] = None
+    meta_description: Optional[str] = None
+    is_featured: Optional[bool] = None
+
+class PostResponse(BaseModel):
+    id: str
+    title: str
+    subtitle: Optional[str] = None
+    content: str
+    excerpt: Optional[str] = None
+    featured_image_url: Optional[str] = None
+    author: Dict[str, str]
+    status: str
+    category: Optional[str] = None
+    tags: List[str]
+    meta_description: Optional[str] = None
+    is_featured: bool
+    read_time: int
+    views: int
+    likes: int
+    created_at: str
+    updated_at: str
+    published_at: Optional[str] = None
+
+class PostListResponse(BaseModel):
+    id: str
+    title: str
+    subtitle: Optional[str] = None
+    excerpt: Optional[str] = None
+    featured_image_url: Optional[str] = None
+    author_name: str
+    category: Optional[str] = None
+    tags: List[str]
+    read_time: int
+    views: int
+    likes: int
+    created_at: str
+    published_at: Optional[str] = None
+
+class CommentCreate(BaseModel):
+    post_id: str
+    author_name: str
+    author_email: EmailStr
+    content: str
+    parent_id: Optional[str] = None
+
+class CommentResponse(BaseModel):
+    id: str
+    post_id: str
+    author_name: str
+    author_email: str
+    content: str
+    parent_id: Optional[str] = None
+    likes: int
+    created_at: str
+    replies: List['CommentResponse'] = []
+
+class NewsletterSend(BaseModel):
+    post_id: str
+    subject: Optional[str] = None
+    custom_message: Optional[str] = None
+
 
 # -------------------- S3 HELPERS --------------------
 s3_client = boto3.client("s3", aws_access_key_id=AWS_ACCESS_KEY_ID, aws_secret_access_key=AWS_SECRET_ACCESS_KEY, region_name=AWS_REGION)
@@ -509,30 +598,92 @@ def load_companies_from_s3():
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to load companies CSV: {str(e)}")
     
-def load_realtime_alerts_csv():
+# Add these two new functions to load India and US alerts separately
+def load_realtime_alerts_india_json():
     try:
         response = s3_client.get_object(
             Bucket=S3_BUCKET_NAME,
-            Key=S3_REALTIME_ALERTS_CSV_KEY
+            Key=S3_REALTIME_ALERTS_INDIA_JSON_KEY
         )
 
-        csv_data = response["Body"].read().decode("utf-8")
+        json_data = json.loads(response["Body"].read().decode("utf-8"))
 
-        df = pd.read_csv(StringIO(csv_data))
+        all_records = []
 
-        # ✅ Convert date column properly
+        # ✅ Handle dictionary format: { "2026-02-23": [ {...}, {...} ] }
+        if isinstance(json_data, dict):
+            for date_key, alerts_list in json_data.items():
+                if isinstance(alerts_list, list):
+                    for alert in alerts_list:
+                        alert["date"] = date_key  # ensure date consistency
+                        all_records.append(alert)
+
+        # ✅ Handle list format (fallback safety)
+        elif isinstance(json_data, list):
+            all_records = json_data
+
+        # Convert to DataFrame
+        df = pd.DataFrame(all_records)
+
+        # Convert date column to datetime.date
         if "date" in df.columns:
             df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
 
-        # ✅ Replace ALL NaN with None (JSON safe)
+        # Replace NaN with None
         df = df.replace({np.nan: None})
 
         return df
 
     except ClientError as e:
         if e.response["Error"]["Code"] == "NoSuchKey":
+            print(f"⚠️ India JSON file not found at {S3_REALTIME_ALERTS_INDIA_JSON_KEY}")
             return pd.DataFrame()
-        raise HTTPException(status_code=500, detail="Failed to load realtime alerts CSV")
+        raise HTTPException(status_code=500, detail=f"Failed to load India alerts JSON: {str(e)}")
+
+    except Exception as e:
+        print(f"❌ Unexpected error loading India JSON: {e}")
+        return pd.DataFrame()
+
+
+def load_realtime_alerts_us_json():
+    try:
+        response = s3_client.get_object(
+            Bucket=S3_BUCKET_NAME,
+            Key=S3_REALTIME_ALERTS_US_JSON_KEY
+        )
+
+        json_data = json.loads(response["Body"].read().decode("utf-8"))
+
+        all_records = []
+
+        # ✅ Handle dictionary format: { "2026-02-23": [ {...}, {...} ] }
+        if isinstance(json_data, dict):
+            for date_key, alerts_list in json_data.items():
+                if isinstance(alerts_list, list):
+                    for alert in alerts_list:
+                        alert["date"] = date_key  # ensure date consistency
+                        all_records.append(alert)
+
+        # Convert to DataFrame
+        df = pd.DataFrame(all_records)
+
+        # Convert date column to datetime.date
+        if "date" in df.columns:
+            df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
+
+        df = df.replace({np.nan: None})
+
+        return df
+
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "NoSuchKey":
+            print(f"⚠️ US JSON file not found at {S3_REALTIME_ALERTS_US_JSON_KEY}")
+            return pd.DataFrame()
+        raise HTTPException(status_code=500, detail=f"Failed to load US alerts JSON: {str(e)}")
+
+    except Exception as e:
+        print(f"❌ Unexpected error loading US JSON: {e}")
+        return pd.DataFrame()
 
 
 def get_ist_today():
@@ -562,6 +713,163 @@ def send_watchlist_telegram_response(chat_id: int, text: str):
     except Exception as e:
         print("Watchlist bot send error:", e)
         return None
+
+def load_posts():
+    """Load all posts from S3"""
+    try:
+        response = s3_client.get_object(Bucket=S3_BUCKET_NAME, Key=S3_POSTS_FILE_KEY)
+        return json.loads(response["Body"].read().decode("utf-8"))
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "NoSuchKey":
+            return []
+        raise HTTPException(status_code=500, detail="Failed to load posts")
+
+def save_posts(posts):
+    """Save all posts to S3"""
+    s3_client.put_object(
+        Bucket=S3_BUCKET_NAME,
+        Key=S3_POSTS_FILE_KEY,
+        Body=json.dumps(posts, indent=4, default=str),
+        ContentType="application/json"
+    )
+
+def load_comments():
+    """Load all comments from S3"""
+    try:
+        response = s3_client.get_object(Bucket=S3_BUCKET_NAME, Key=S3_COMMENTS_FILE_KEY)
+        return json.loads(response["Body"].read().decode("utf-8"))
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "NoSuchKey":
+            return []
+        raise HTTPException(status_code=500, detail="Failed to load comments")
+
+def save_comments(comments):
+    """Save all comments to S3"""
+    s3_client.put_object(
+        Bucket=S3_BUCKET_NAME,
+        Key=S3_COMMENTS_FILE_KEY,
+        Body=json.dumps(comments, indent=4, default=str),
+        ContentType="application/json"
+    )
+
+def load_newsletters():
+    """Load newsletter sending history from S3"""
+    try:
+        response = s3_client.get_object(Bucket=S3_BUCKET_NAME, Key=S3_NEWSLETTERS_FILE_KEY)
+        return json.loads(response["Body"].read().decode("utf-8"))
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "NoSuchKey":
+            return []
+        raise HTTPException(status_code=500, detail="Failed to load newsletters")
+
+def save_newsletters(newsletters):
+    """Save newsletter history to S3"""
+    s3_client.put_object(
+        Bucket=S3_BUCKET_NAME,
+        Key=S3_NEWSLETTERS_FILE_KEY,
+        Body=json.dumps(newsletters, indent=4, default=str),
+        ContentType="application/json"
+    )
+
+def calculate_read_time(content: str) -> int:
+    """Calculate read time in minutes based on content length"""
+    words_per_minute = 200
+    word_count = len(content.split())
+    read_time = max(1, round(word_count / words_per_minute))
+    return read_time
+
+def process_post_image(image_data: bytes, filename: str) -> str:
+    """Process and upload post image to S3"""
+    try:
+        # Generate unique filename
+        ext = filename.split('.')[-1].lower()
+        unique_filename = f"{uuid4()}.{ext}"
+        s3_key = f"{S3_POST_IMAGES_KEY}{unique_filename}"
+        
+        # Optional: Resize/optimize image
+        img = Image.open(io.BytesIO(image_data))
+        
+        # Convert to RGB if necessary
+        if img.mode in ('RGBA', 'P'):
+            img = img.convert('RGB')
+        
+        # Resize if too large (max width 1200px)
+        if img.width > 1200:
+            ratio = 1200 / img.width
+            new_height = int(img.height * ratio)
+            img = img.resize((1200, new_height), Image.Resampling.LANCZOS)
+        
+        # Save to bytes
+        img_byte_arr = io.BytesIO()
+        img.save(img_byte_arr, format='JPEG', quality=85, optimize=True)
+        img_byte_arr = img_byte_arr.getvalue()
+        
+        # Upload to S3
+        content_type = f"image/{ext}" if ext != 'jpg' else "image/jpeg"
+        s3_client.put_object(
+            Bucket=S3_BUCKET_NAME,
+            Key=s3_key,
+            Body=img_byte_arr,
+            ContentType=content_type,
+            CacheControl="max-age=31536000"
+        )
+        
+        # Return public URL
+        return f"https://{S3_BUCKET_NAME}.s3.{AWS_REGION}.amazonaws.com/{s3_key}"
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to process image: {str(e)}")
+
+def send_newsletter_email(post_title: str, post_excerpt: str, post_url: str, subscriber_email: str, custom_message: Optional[str] = None):
+    """Send newsletter email to subscriber"""
+    try:
+        msg = MIMEMultipart()
+        msg["From"] = EMAIL_SENDER
+        msg["To"] = subscriber_email
+        msg["Subject"] = f"📬 New Post: {post_title} - AIFinverse"
+
+        body = f"""
+<html>
+<body style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+    <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 30px; text-align: center; color: white;">
+        <h1 style="margin: 0;">AIFinverse</h1>
+        <p style="margin: 10px 0 0; opacity: 0.9;">Market Insights & Analysis</p>
+    </div>
+    
+    <div style="padding: 30px;">
+        <h2 style="color: #333; margin-top: 0;">{post_title}</h2>
+        
+        {f'<p style="color: #666; font-style: italic;">{post_excerpt}</p>' if post_excerpt else ''}
+        
+        {f'<div style="background: #f5f5f5; padding: 15px; border-left: 4px solid #667eea; margin: 20px 0;">{custom_message}</div>' if custom_message else ''}
+        
+        <p>We've just published a new market insight. Click the button below to read the full post:</p>
+        
+        <div style="text-align: center; margin: 30px 0;">
+            <a href="{post_url}" style="background: #667eea; color: white; padding: 12px 30px; text-decoration: none; border-radius: 5px; font-weight: bold;">Read Full Post →</a>
+        </div>
+        
+        <hr style="border: none; border-top: 1px solid #eee; margin: 30px 0;">
+        
+        <p style="color: #999; font-size: 12px; text-align: center;">
+            You're receiving this because you subscribed to AIFinverse newsletter.<br>
+            <a href="https://aifinverse.com/unsubscribe?email={subscriber_email}" style="color: #667eea;">Unsubscribe</a>
+        </p>
+    </div>
+</body>
+</html>
+"""
+        msg.attach(MIMEText(body, "html"))
+
+        server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
+        server.starttls()
+        server.login(EMAIL_SENDER, EMAIL_PASSWORD)
+        server.send_message(msg)
+        server.quit()
+        
+    except Exception as e:
+        print(f"❌ Newsletter email failed for {subscriber_email}: {e}")
+        # Don't raise exception - continue with other subscribers
 
 
 # -------------------- AUTH ENDPOINTS --------------------
@@ -1345,9 +1653,10 @@ def get_all_users():
         "fetched_at": datetime.utcnow().isoformat()
     }
 
+# Update the live alerts endpoints
 @app.get("/alerts/live/india")
 def get_today_india_alerts():
-    df = load_realtime_alerts_csv()
+    df = load_realtime_alerts_india_json()
 
     if df.empty:
         return {
@@ -1358,26 +1667,28 @@ def get_today_india_alerts():
             "alerts": []
         }
 
-    today = get_ist_today()
+    # Get today's date in IST
+    ist = pytz.timezone("Asia/Kolkata")
+    today_ist = datetime.now(ist).date()
+    
+    print(f"📅 Today's IST date: {today_ist}")
+    print(f"📊 Total records in India JSON: {len(df)}")
+    
+    # Filter by today (IST date) - No need to filter by market since it's India-specific file
+    india_df = df[df["date"] == today_ist]
 
-    # Ensure date column is string
-    df["date"] = df["date"].astype(str)
+    print(f"✅ Found {len(india_df)} India alerts for today")
 
-    # Filter by today (IST date) and India market
-    india_df = df[
-        (df["date"] == today) &
-        (df["market"] == "India")
-    ]
-
-    # Sort by timestamp descending
-    if "timestamp" in india_df.columns:
+    # Sort by timestamp descending if available
+    if "timestamp" in india_df.columns and not india_df.empty:
         india_df = india_df.sort_values(by="timestamp", ascending=False)
 
+    # Convert to records
     alerts = india_df.to_dict(orient="records")
 
     return {
         "market": "India",
-        "date": today,
+        "date": today_ist.strftime("%Y-%m-%d"),
         "timezone": "Asia/Kolkata",
         "count": len(alerts),
         "alerts": alerts
@@ -1385,46 +1696,50 @@ def get_today_india_alerts():
 
 @app.get("/alerts/live/us")
 def get_today_us_alerts():
-    df = load_realtime_alerts_csv()
+    df = load_realtime_alerts_us_json()
 
     if df.empty:
         return {
             "market": "US",
-            "date": get_ist_today(),
-            "timezone": "Asia/Kolkata",
+            "date": datetime.now(pytz.UTC).strftime("%Y-%m-%d"),
+            "timezone": "UTC",
             "count": 0,
             "alerts": []
         }
 
-    today = get_ist_today()
+    # Get today's date in UTC (since US data is stored in UTC)
+    utc_now = datetime.now(pytz.UTC)
+    today_utc = utc_now.date()
+    
+    print(f"📅 Today's UTC date: {today_utc}")
+    print(f"📊 Total records in US JSON: {len(df)}")
 
-    df["date"] = df["date"].astype(str)
+    # Filter by today (UTC date) - No need to filter by market since it's US-specific file
+    us_df = df[df["date"] == today_utc]
 
-    # Filter by today and US market
-    us_df = df[
-        (df["date"] == today) &
-        (df["market"] == "US")
-    ]
+    print(f"✅ Found {len(us_df)} US alerts for today")
 
-    # Sort by timestamp descending
-    if "timestamp" in us_df.columns:
+    # Sort by timestamp descending if available
+    if "timestamp" in us_df.columns and not us_df.empty:
         us_df = us_df.sort_values(by="timestamp", ascending=False)
 
+    # Convert to records
     alerts = us_df.to_dict(orient="records")
 
     return {
         "market": "US",
-        "date": today,
-        "timezone": "Asia/Kolkata",
+        "date": today_utc.strftime("%Y-%m-%d"),
+        "timezone": "UTC",
         "count": len(alerts),
         "alerts": alerts
     }
 
+# Update the history endpoints
 @app.get("/alerts/history/india")
 def get_india_alert_history():
-    df = load_realtime_alerts_csv()
+    df = load_realtime_alerts_india_json()
 
-    if df.empty:
+    if df.empty or "date" not in df.columns:
         return {
             "market": "India",
             "timezone": "Asia/Kolkata",
@@ -1436,22 +1751,36 @@ def get_india_alert_history():
     today = datetime.now(ist).date()
     seven_days_ago = today - timedelta(days=7)
 
-    # Normalize market column
-    df["market"] = df["market"].astype(str).str.upper().str.strip()
+    from_date = seven_days_ago
+    to_date = today - timedelta(days=1)  # exclude today
+
+    print(f"📅 India history range: {from_date} to {to_date}")
 
     india_df = df[
-        (df["date"] >= seven_days_ago) &
-        (df["date"] <= today) &
-        (df["market"] == "INDIA")
+        (df["date"] >= from_date) &
+        (df["date"] <= to_date)
     ]
+
+    # Sort safely
+    if not india_df.empty:
+        if "timestamp" in india_df.columns:
+            india_df = india_df.sort_values(
+                by=["date", "timestamp"],
+                ascending=[False, False]
+            )
+        else:
+            india_df = india_df.sort_values(
+                by="date",
+                ascending=False
+            )
 
     alerts = india_df.to_dict(orient="records")
 
     return {
         "market": "India",
         "timezone": "Asia/Kolkata",
-        "from_date": str(seven_days_ago),
-        "to_date": str(today),
+        "from_date": str(from_date),
+        "to_date": str(to_date),
         "count": len(alerts),
         "alerts": alerts
     }
@@ -1459,49 +1788,54 @@ def get_india_alert_history():
 
 @app.get("/alerts/history/us")
 def get_us_alert_history():
-    df = load_realtime_alerts_csv()
+    df = load_realtime_alerts_us_json()
 
-    if df.empty:
+    if df.empty or "date" not in df.columns:
         return {
             "market": "US",
-            "timezone": "Asia/Kolkata",
-            "days": 7,
+            "timezone": "UTC",
             "count": 0,
             "alerts": []
         }
 
-    ist = pytz.timezone("Asia/Kolkata")
-    today = datetime.now(ist).date()
+    utc_now = datetime.now(pytz.UTC)
+    today = utc_now.date()
     seven_days_ago = today - timedelta(days=7)
 
-    df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
+    from_date = seven_days_ago
+    to_date = today - timedelta(days=1)  # exclude today
 
-    # Filter last 7 days and US market
+    print(f"📅 US history range: {from_date} to {to_date}")
+
     us_df = df[
-        (df["date"] >= seven_days_ago) &
-        (df["date"] <= today) &
-        (df["market"] == "US")
+        (df["date"] >= from_date) &
+        (df["date"] <= to_date)
     ]
 
-    # Sort by date + timestamp (latest first)
-    if "timestamp" in us_df.columns:
-        us_df = us_df.sort_values(
-            by=["date", "timestamp"],
-            ascending=False
-        )
-    else:
-        us_df = us_df.sort_values(by="date", ascending=False)
+    # Sort safely
+    if not us_df.empty:
+        if "timestamp" in us_df.columns:
+            us_df = us_df.sort_values(
+                by=["date", "timestamp"],
+                ascending=[False, False]
+            )
+        else:
+            us_df = us_df.sort_values(
+                by="date",
+                ascending=False
+            )
 
     alerts = us_df.to_dict(orient="records")
 
     return {
         "market": "US",
-        "timezone": "Asia/Kolkata",
-        "from_date": str(seven_days_ago),
-        "to_date": str(today),
+        "timezone": "UTC",
+        "from_date": str(from_date),
+        "to_date": str(to_date),
         "count": len(alerts),
         "alerts": alerts
     }
+
 
 @app.post("/telegram/webhook/watchlist")
 async def telegram_webhook_watchlist(request: Request):
@@ -1548,9 +1882,22 @@ async def telegram_webhook_watchlist(request: Request):
 
         # 2️⃣ Handle Email Linking
         if "@" in text and "." in text:
-            linked = link_watchlist_bot_to_user(text)
+            users = load_users()
+            linked = False
+
+            for user in users:
+                if user["email"].lower() == text.lower():
+                    # ✅ Save watchlist chat id inside same user
+                    user["watchlist_chat_id"] = chat_id
+                    user["watchlist_linked"] = "yes"
+                    user["watchlist_linked_at"] = datetime.utcnow().isoformat()
+
+                    linked = True
+                    break
 
             if linked:
+                save_users(users)
+
                 send_watchlist_telegram_response(
                     chat_id,
                     "✅ Watchlist bot linked successfully!\n\nYou will now receive watchlist notifications 📊"
@@ -1567,3 +1914,495 @@ async def telegram_webhook_watchlist(request: Request):
         print("❌ Watchlist webhook unexpected error:", e)
         return {"status": "ok"}
 
+# -------------------- POST ENDPOINTS --------------------
+
+@app.post("/admin/posts/create", response_model=PostResponse)
+def create_post(post: PostCreate):
+    """Create a new post (Admin only - protected by admin key in production)"""
+    # In production, add proper authentication middleware
+    
+    posts = load_posts()
+    
+    # Get admin user (first admin or create system user)
+    users = load_users()
+    admin_user = next((u for u in users if u.get("is_admin", False)), None)
+    
+    if not admin_user:
+        # Create system admin if none exists
+        admin_user = {
+            "user_id": "system",
+            "first_name": "AIFinverse",
+            "last_name": "Admin",
+            "email": "admin@aifinverse.com"
+        }
+    
+    now = datetime.utcnow().isoformat() + "Z"
+    
+    new_post = {
+        "id": str(uuid4()),
+        "title": post.title,
+        "subtitle": post.subtitle,
+        "content": post.content,
+        "excerpt": post.excerpt or post.content[:200] + "..." if len(post.content) > 200 else post.content,
+        "featured_image_url": post.featured_image_url,
+        "author": {
+            "id": admin_user["user_id"],
+            "name": f"{admin_user['first_name']} {admin_user['last_name']}",
+            "email": admin_user["email"]
+        },
+        "status": post.status,
+        "category": post.category,
+        "tags": post.tags,
+        "meta_description": post.meta_description or post.excerpt or post.content[:160],
+        "is_featured": post.is_featured,
+        "read_time": calculate_read_time(post.content),
+        "views": 0,
+        "likes": 0,
+        "created_at": now,
+        "updated_at": now,
+        "published_at": now if post.status == "published" else None
+    }
+    
+    posts.append(new_post)
+    save_posts(posts)
+    
+    return new_post
+
+@app.post("/admin/posts/{post_id}/images/upload")
+async def upload_post_image(post_id: str, file: UploadFile = File(...)):
+    """Upload an image for a specific post"""
+    
+    # Validate file type
+    allowed_types = ['image/jpeg', 'image/png', 'image/gif', 'image/webp']
+    if file.content_type not in allowed_types:
+        raise HTTPException(status_code=400, detail="Only JPEG, PNG, GIF and WebP images are allowed")
+    
+    # Read file
+    contents = await file.read()
+    
+    # Process and upload
+    image_url = process_post_image(contents, file.filename)
+    
+    # Update post to include image reference
+    posts = load_posts()
+    post = next((p for p in posts if p["id"] == post_id), None)
+    
+    if post:
+        # Add to post's images list
+        post.setdefault("images", [])
+        if image_url not in post["images"]:
+            post["images"].append(image_url)
+        save_posts(posts)
+    
+    return {
+        "url": image_url,
+        "filename": file.filename,
+        "post_id": post_id
+    }
+
+@app.post("/admin/posts/images/upload")
+async def upload_image(file: UploadFile = File(...)):
+    """Upload an image for use in posts (returns URL for embedding)"""
+    
+    allowed_types = ['image/jpeg', 'image/png', 'image/gif', 'image/webp']
+    if file.content_type not in allowed_types:
+        raise HTTPException(status_code=400, detail="Only JPEG, PNG, GIF and WebP images are allowed")
+    
+    contents = await file.read()
+    image_url = process_post_image(contents, file.filename)
+    
+    return {
+        "url": image_url,
+        "filename": file.filename
+    }
+
+@app.put("/admin/posts/{post_id}", response_model=PostResponse)
+def update_post(post_id: str, post_update: PostUpdate):
+    """Update an existing post"""
+    
+    posts = load_posts()
+    post = next((p for p in posts if p["id"] == post_id), None)
+    
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+    
+    # Update fields
+    update_data = post_update.dict(exclude_unset=True)
+    
+    for field, value in update_data.items():
+        if value is not None:
+            post[field] = value
+    
+    # Recalculate excerpt if content changed
+    if "content" in update_data:
+        post["excerpt"] = post.get("excerpt") or post["content"][:200] + "..." if len(post["content"]) > 200 else post["content"]
+        post["read_time"] = calculate_read_time(post["content"])
+    
+    # Update timestamps
+    post["updated_at"] = datetime.utcnow().isoformat() + "Z"
+    if post["status"] == "published" and not post.get("published_at"):
+        post["published_at"] = post["updated_at"]
+    
+    save_posts(posts)
+    return post
+
+@app.delete("/admin/posts/{post_id}")
+def delete_post(post_id: str):
+    """Delete a post"""
+    
+    posts = load_posts()
+    post = next((p for p in posts if p["id"] == post_id), None)
+    
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+    
+    posts = [p for p in posts if p["id"] != post_id]
+    save_posts(posts)
+    
+    return {"message": "Post deleted successfully"}
+
+@app.get("/admin/posts/drafts")
+def get_drafts():
+    """Get all draft posts (Admin only)"""
+    posts = load_posts()
+    drafts = [p for p in posts if p["status"] == "draft"]
+    
+    # Sort by updated_at descending
+    drafts.sort(key=lambda x: x["updated_at"], reverse=True)
+    
+    return {
+        "count": len(drafts),
+        "drafts": drafts
+    }
+
+@app.post("/admin/posts/{post_id}/publish")
+def publish_post(post_id: str):
+    """Publish a draft post"""
+    
+    posts = load_posts()
+    post = next((p for p in posts if p["id"] == post_id), None)
+    
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+    
+    now = datetime.utcnow().isoformat() + "Z"
+    post["status"] = "published"
+    post["published_at"] = now
+    post["updated_at"] = now
+    
+    save_posts(posts)
+    
+    return {"message": "Post published successfully", "post": post}
+
+@app.post("/admin/posts/{post_id}/send-newsletter")
+def send_post_newsletter(post_id: str, newsletter: NewsletterSend):
+    """Send post as newsletter to all subscribers"""
+    
+    # Load post
+    posts = load_posts()
+    post = next((p for p in posts if p["id"] == post_id), None)
+    
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+    
+    if post["status"] != "published":
+        raise HTTPException(status_code=400, detail="Only published posts can be sent as newsletters")
+    
+    # Load subscribers
+    subscribers = load_subscribed_emails()
+    
+    if not subscribers:
+        return {"message": "No subscribers found", "sent_count": 0}
+    
+    # Prepare email data
+    post_url = f"https://aifinverse.com/posts/{post_id}"
+    subject = newsletter.subject or f"New Post: {post['title']}"
+    
+    # Send to all subscribers
+    sent_count = 0
+    failed_count = 0
+    
+    for subscriber in subscribers:
+        try:
+            send_newsletter_email(
+                post_title=post['title'],
+                post_excerpt=post.get('excerpt', ''),
+                post_url=post_url,
+                subscriber_email=subscriber['email'],
+                custom_message=newsletter.custom_message
+            )
+            sent_count += 1
+        except Exception as e:
+            print(f"Failed to send to {subscriber['email']}: {e}")
+            failed_count += 1
+    
+    # Log newsletter send
+    newsletters = load_newsletters()
+    newsletters.append({
+        "id": str(uuid4()),
+        "post_id": post_id,
+        "post_title": post['title'],
+        "subject": subject,
+        "sent_at": datetime.utcnow().isoformat() + "Z",
+        "sent_count": sent_count,
+        "failed_count": failed_count
+    })
+    save_newsletters(newsletters)
+    
+    return {
+        "message": "Newsletter sent successfully",
+        "post_id": post_id,
+        "post_title": post['title'],
+        "sent_count": sent_count,
+        "failed_count": failed_count,
+        "total_subscribers": len(subscribers)
+    }
+
+# -------------------- PUBLIC POST ENDPOINTS --------------------
+
+@app.get("/posts", response_model=List[PostListResponse])
+def get_posts(
+    page: int = 1,
+    limit: int = 10,
+    category: Optional[str] = None,
+    tag: Optional[str] = None,
+    featured: bool = False
+):
+    """Get published posts with pagination and filtering"""
+    
+    posts = load_posts()
+    
+    # Filter published posts
+    published_posts = [p for p in posts if p["status"] == "published"]
+    
+    # Apply filters
+    if category:
+        published_posts = [p for p in published_posts if p.get("category") == category]
+    
+    if tag:
+        published_posts = [p for p in published_posts if tag in p.get("tags", [])]
+    
+    if featured:
+        published_posts = [p for p in published_posts if p.get("is_featured", False)]
+    
+    # Sort by published date (newest first)
+    published_posts.sort(key=lambda x: x.get("published_at", ""), reverse=True)
+    
+    # Paginate
+    start = (page - 1) * limit
+    end = start + limit
+    paginated_posts = published_posts[start:end]
+    
+    # Format response
+    result = []
+    for post in paginated_posts:
+        result.append({
+            "id": post["id"],
+            "title": post["title"],
+            "subtitle": post.get("subtitle"),
+            "excerpt": post.get("excerpt"),
+            "featured_image_url": post.get("featured_image_url"),
+            "author_name": post["author"]["name"],
+            "category": post.get("category"),
+            "tags": post.get("tags", []),
+            "read_time": post.get("read_time", 1),
+            "views": post.get("views", 0),
+            "likes": post.get("likes", 0),
+            "created_at": post["created_at"],
+            "published_at": post.get("published_at")
+        })
+    
+    return result
+
+@app.get("/posts/{post_id}", response_model=PostResponse)
+def get_post(post_id: str):
+    """Get a single post by ID"""
+    
+    posts = load_posts()
+    post = next((p for p in posts if p["id"] == post_id), None)
+    
+    if not post or post["status"] != "published":
+        raise HTTPException(status_code=404, detail="Post not found")
+    
+    # Increment view count
+    post["views"] = post.get("views", 0) + 1
+    save_posts(posts)
+    
+    return post
+
+@app.get("/posts/slug/{slug}", response_model=PostResponse)
+def get_post_by_slug(slug: str):
+    """Get a single post by slug (URL-friendly title)"""
+    
+    posts = load_posts()
+    
+    # Create slug from title (simplified - in production, store slug in post data)
+    post = next((p for p in posts if p["status"] == "published"), None)
+    
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+    
+    # Increment view count
+    post["views"] = post.get("views", 0) + 1
+    save_posts(posts)
+    
+    return post
+
+@app.get("/posts/featured/latest")
+def get_latest_featured():
+    """Get the latest featured post for homepage"""
+    
+    posts = load_posts()
+    
+    featured_posts = [
+        p for p in posts 
+        if p["status"] == "published" and p.get("is_featured", False)
+    ]
+    
+    if not featured_posts:
+        # Return most recent published post
+        published_posts = [p for p in posts if p["status"] == "published"]
+        if published_posts:
+            published_posts.sort(key=lambda x: x.get("published_at", ""), reverse=True)
+            return published_posts[0]
+        return None
+    
+    featured_posts.sort(key=lambda x: x.get("published_at", ""), reverse=True)
+    return featured_posts[0]
+
+# -------------------- COMMENTS ENDPOINTS --------------------
+
+@app.post("/posts/{post_id}/comments")
+def add_comment(post_id: str, comment: CommentCreate):
+    """Add a comment to a post"""
+    
+    # Verify post exists
+    posts = load_posts()
+    post = next((p for p in posts if p["id"] == post_id and p["status"] == "published"), None)
+    
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+    
+    comments = load_comments()
+    
+    now = datetime.utcnow().isoformat() + "Z"
+    
+    new_comment = {
+        "id": str(uuid4()),
+        "post_id": post_id,
+        "author_name": comment.author_name,
+        "author_email": comment.author_email.lower(),
+        "content": comment.content,
+        "parent_id": comment.parent_id,
+        "likes": 0,
+        "created_at": now,
+        "status": "approved"  # Auto-approve for now
+    }
+    
+    comments.append(new_comment)
+    save_comments(comments)
+    
+    return new_comment
+
+@app.get("/posts/{post_id}/comments")
+def get_post_comments(post_id: str):
+    """Get all comments for a post"""
+    
+    comments = load_comments()
+    post_comments = [c for c in comments if c["post_id"] == post_id and c["status"] == "approved"]
+    
+    # Build comment tree
+    comment_map = {}
+    root_comments = []
+    
+    # First pass: create all comments
+    for comment in post_comments:
+        comment["replies"] = []
+        comment_map[comment["id"]] = comment
+    
+    # Second pass: organize replies
+    for comment in post_comments:
+        if comment.get("parent_id") and comment["parent_id"] in comment_map:
+            # This is a reply
+            comment_map[comment["parent_id"]]["replies"].append(comment)
+        elif not comment.get("parent_id"):
+            # This is a root comment
+            root_comments.append(comment)
+    
+    # Sort root comments by date (newest first)
+    root_comments.sort(key=lambda x: x["created_at"], reverse=True)
+    
+    return {
+        "post_id": post_id,
+        "total_comments": len(post_comments),
+        "comments": root_comments
+    }
+
+@app.post("/comments/{comment_id}/like")
+def like_comment(comment_id: str):
+    """Like a comment"""
+    
+    comments = load_comments()
+    comment = next((c for c in comments if c["id"] == comment_id), None)
+    
+    if not comment:
+        raise HTTPException(status_code=404, detail="Comment not found")
+    
+    comment["likes"] = comment.get("likes", 0) + 1
+    save_comments(comments)
+    
+    return {"likes": comment["likes"]}
+
+# -------------------- ADMIN STATS ENDPOINTS --------------------
+
+@app.get("/admin/stats/posts")
+def get_post_stats():
+    """Get post statistics for admin dashboard"""
+    
+    posts = load_posts()
+    
+    published_posts = [p for p in posts if p["status"] == "published"]
+    draft_posts = [p for p in posts if p["status"] == "draft"]
+    
+    total_views = sum(p.get("views", 0) for p in posts)
+    total_likes = sum(p.get("likes", 0) for p in posts)
+    
+    # Posts by category
+    categories = {}
+    for post in published_posts:
+        category = post.get("category", "Uncategorized")
+        if category not in categories:
+            categories[category] = 0
+        categories[category] += 1
+    
+    # Posts by month
+    from collections import defaultdict
+    monthly_posts = defaultdict(int)
+    for post in published_posts:
+        if post.get("published_at"):
+            month = post["published_at"][:7]  # YYYY-MM
+            monthly_posts[month] += 1
+    
+    return {
+        "total_posts": len(posts),
+        "published": len(published_posts),
+        "drafts": len(draft_posts),
+        "total_views": total_views,
+        "total_likes": total_likes,
+        "categories": categories,
+        "monthly_posts": dict(monthly_posts)
+    }
+
+@app.get("/admin/newsletters/history")
+def get_newsletter_history():
+    """Get newsletter sending history"""
+    
+    newsletters = load_newsletters()
+    
+    # Sort by sent_at descending
+    newsletters.sort(key=lambda x: x["sent_at"], reverse=True)
+    
+    return {
+        "total_sent": len(newsletters),
+        "history": newsletters
+    }
