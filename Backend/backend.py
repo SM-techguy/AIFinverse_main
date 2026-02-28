@@ -27,15 +27,15 @@ SMTP_PORT = 587
 EMAIL_SENDER = "info@aifinverse.com"
 EMAIL_PASSWORD = "$AIfin123" 
 
-AWS_ACCESS_KEY_ID = "AKIA3NUGFTNOMHFO4X4A"
-AWS_SECRET_ACCESS_KEY = "4f9Y9pEHIesHbMlEj+eEYedM9trVsfi0GLCxv5Du"
+AWS_ACCESS_KEY_ID = "YOUR_AWS_ACCESS_KEY_ID"
+AWS_SECRET_ACCESS_KEY = "YOUR_AWS_SECRET_ACCESS_KEY"
 AWS_REGION = "us-east-1"
 S3_BUCKET_NAME = "aifinverse"
 S3_USERS_FILE_KEY = "users.json"
 S3_REALTIME_ALERTS_INDIA_JSON_KEY = "52_WH/realtime_alerts_INDIA.json"  # India alerts JSON file
 S3_REALTIME_ALERTS_US_JSON_KEY = "52_WH/realtime_alerts_US.json"  # US alerts JSON file
 
-TAVILY_API_KEY = "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"
+TAVILY_API_KEY = "YOUR_TAVILY_API_KEY"
 TAVILY_SEARCH_URL = "https://api.tavily.com/search"
 
 TELEGRAM_BOT_TOKEN_US = "8515387318:AAEKWrh35aAG1vIhQe4Nde7pmRLvcNGggxY"
@@ -2406,3 +2406,4 @@ def get_newsletter_history():
         "total_sent": len(newsletters),
         "history": newsletters
     }
+
